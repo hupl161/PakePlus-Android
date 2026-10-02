@@ -12,6 +12,7 @@
  *   jp_books_v1      书籍/章节（纯分类层）
  *                    [{id,name,createdAt,chapters:[{id,name,createdAt}]}]
  *                    题目/卡片通过 bookId、chapterId 归属；字段缺失视为未分类
+ *   jp_reading_v1    阅读理解独立书架（书籍 → 单元 → 挖空文章，见下方注释）
  * =================================================================== */
 
 const Store = {
@@ -31,7 +32,8 @@ const Store = {
     bombCustom: 'jp_bombcustom_v1',
     bombLabels: 'jp_bomblabels_v1',
     bombProgress: 'jp_bombprogress_v1',
-    books: 'jp_books_v1'
+    books: 'jp_books_v1',
+    reading: 'jp_reading_v1'
   },
 
   _read(key, fallback) {
@@ -267,6 +269,7 @@ const Store = {
       this.questionDedupKey(point, stem, bookId, chapterId))) return { error: 'dup' };
     const card = this.getCardByName(point);
     const opts = question.options || {};
+    const oc = question.optionCards || {};
     const item = {
       id: question.id || this.uid('q'),
       category: question.category || (card && card.category) || '自定义',
@@ -278,6 +281,13 @@ const Store = {
         B: String(opts.B == null ? '' : opts.B),
         C: String(opts.C == null ? '' : opts.C),
         D: String(opts.D == null ? '' : opts.D)
+      },
+      /* 选项 → 语法点卡片名指针（只存名，不复制卡片内容；缺省为空串） */
+      optionCards: {
+        A: oc.A ? String(oc.A) : '',
+        B: oc.B ? String(oc.B) : '',
+        C: oc.C ? String(oc.C) : '',
+        D: oc.D ? String(oc.D) : ''
       },
       answer: 'ABCD'.includes(question.answer) ? question.answer : 'A',
       explanation: question.explanation || '',
@@ -481,6 +491,25 @@ const Store = {
   cardHasScope(card, bookId, chapterId) {
     const b = bookId || '', ch = chapterId || '';
     return this.cardScopes(card).some(s => s.bookId === b && s.chapterId === ch);
+  },
+
+  /**
+   * 单元（书+章）维度的卡片刷题进度：
+   *  total 归属该单元的卡片数
+   *  done  已刷完（completed 标记）
+   *  half  刷过但没刷完（pointMeta.attempts>0 且未完成）
+   *  fresh 还没刷过
+   */
+  chapterCardProgress(bookId, chapterId) {
+    const cards = this.getCards().filter(c => this.cardHasScope(c, bookId, chapterId));
+    const meta = this.getPointMeta();
+    const doneMap = this.getCompleted();
+    let done = 0, half = 0;
+    cards.forEach(c => {
+      if (doneMap[c.name]) done++;
+      else if ((meta[c.name] && meta[c.name].attempts > 0)) half++;
+    });
+    return { total: cards.length, done, half, fresh: cards.length - done - half };
   },
 
   /**
@@ -920,6 +949,202 @@ const Store = {
 
   deleteArticle(id) {
     this.saveArticles(this.getArticles().filter(x => x.id !== id));
+  },
+
+  /* ---------------- 阅读理解（独立书架：书籍 → 单元 → 文章） ----------------
+   * jp_reading_v1:
+   * [{ id, name, createdAt, lastStudyAt,
+   *    units: [{ id, name, createdAt,
+   *      articles: [{ id, title, text(挖空为（1）（2）…), createdAt, favorite,
+   *        blanks: [{ no, options:{A,B,C,D}, answer, explanation, points:[],
+   *                   qid(答错时同步进题库的题id), lastWrong }],
+   *        precisionId(已导入精读的 articleId),
+   *        state: { chosen:{no:letter}, submitted, correct, total,
+   *                 updatedAt, history:[{ts,correct,total}] } }] }] }] */
+  getReadingBooks() {
+    return this._read(this.KEYS.reading, []);
+  },
+
+  saveReadingBooks(list) {
+    this._write(this.KEYS.reading, Array.isArray(list) ? list : []);
+  },
+
+  getReadingBookById(id) {
+    return this.getReadingBooks().find(b => b.id === id) || null;
+  },
+
+  /** 新建阅读理解书籍（同名忽略大小写/空白判重），重名或空名返回 null */
+  addReadingBook(name) {
+    name = String(name || '').trim();
+    if (!name) return null;
+    const books = this.getReadingBooks();
+    if (books.some(b => b.name.trim().toLowerCase() === name.toLowerCase())) return null;
+    const book = { id: this.uid('rb'), name, createdAt: Date.now(), lastStudyAt: 0, units: [] };
+    books.push(book);
+    this.saveReadingBooks(books);
+    return book;
+  },
+
+  /** 按名取书，不存在则新建（导入用） */
+  ensureReadingBook(name) {
+    name = String(name || '').trim();
+    if (!name) return null;
+    const hit = this.getReadingBooks().find(
+      b => b.name.trim().toLowerCase() === name.toLowerCase());
+    return hit || this.addReadingBook(name);
+  },
+
+  renameReadingBook(id, name) {
+    name = String(name || '').trim();
+    if (!name) return false;
+    const books = this.getReadingBooks();
+    const b = books.find(x => x.id === id);
+    if (!b) return false;
+    if (books.some(x => x.id !== id &&
+      x.name.trim().toLowerCase() === name.toLowerCase())) return false;
+    b.name = name;
+    this.saveReadingBooks(books);
+    return true;
+  },
+
+  /** 收集文章已同步进题库的题 id（级联删除用） */
+  _readingQids(articles) {
+    const ids = [];
+    (articles || []).forEach(a => (a.blanks || []).forEach(b => {
+      if (b.qid) ids.push(b.qid);
+    }));
+    return ids;
+  },
+
+  deleteReadingBook(id) {
+    const books = this.getReadingBooks();
+    const b = books.find(x => x.id === id);
+    if (!b) return false;
+    const qids = [];
+    (b.units || []).forEach(u => qids.push(...this._readingQids(u.articles)));
+    this.saveReadingBooks(books.filter(x => x.id !== id));
+    if (qids.length) this.deleteQuestionsByIds(qids);
+    return true;
+  },
+
+  addReadingUnit(bookId, name) {
+    name = String(name || '').trim();
+    if (!name) return null;
+    const books = this.getReadingBooks();
+    const b = books.find(x => x.id === bookId);
+    if (!b) return null;
+    if (!Array.isArray(b.units)) b.units = [];
+    if (b.units.some(u => u.name.trim().toLowerCase() === name.toLowerCase())) return null;
+    const unit = { id: this.uid('ru'), name, createdAt: Date.now(), articles: [] };
+    b.units.push(unit);
+    this.saveReadingBooks(books);
+    return unit;
+  },
+
+  /** 按名取单元，不存在则新建（导入用） */
+  ensureReadingUnit(bookId, name) {
+    name = String(name || '').trim();
+    if (!name) return null;
+    const b = this.getReadingBookById(bookId);
+    if (!b) return null;
+    const hit = (b.units || []).find(
+      u => u.name.trim().toLowerCase() === name.toLowerCase());
+    return hit || this.addReadingUnit(bookId, name);
+  },
+
+  renameReadingUnit(bookId, unitId, name) {
+    name = String(name || '').trim();
+    if (!name) return false;
+    const books = this.getReadingBooks();
+    const b = books.find(x => x.id === bookId);
+    if (!b || !Array.isArray(b.units)) return false;
+    const u = b.units.find(x => x.id === unitId);
+    if (!u) return false;
+    if (b.units.some(x => x.id !== unitId &&
+      x.name.trim().toLowerCase() === name.toLowerCase())) return false;
+    u.name = name;
+    this.saveReadingBooks(books);
+    return true;
+  },
+
+  deleteReadingUnit(bookId, unitId) {
+    const books = this.getReadingBooks();
+    const b = books.find(x => x.id === bookId);
+    if (!b || !Array.isArray(b.units)) return false;
+    const u = b.units.find(x => x.id === unitId);
+    if (!u) return false;
+    const qids = this._readingQids(u.articles);
+    b.units = b.units.filter(x => x.id !== unitId);
+    this.saveReadingBooks(books);
+    if (qids.length) this.deleteQuestionsByIds(qids);
+    return true;
+  },
+
+  /** 跨书定位文章，返回 {book, unit, article} 或 null */
+  findReadingArticle(articleId) {
+    const books = this.getReadingBooks();
+    for (const b of books) {
+      for (const u of (b.units || [])) {
+        const a = (u.articles || []).find(x => x.id === articleId);
+        if (a) return { book: b, unit: u, article: a };
+      }
+    }
+    return null;
+  },
+
+  addReadingArticle(bookId, unitId, article) {
+    const books = this.getReadingBooks();
+    const b = books.find(x => x.id === bookId);
+    if (!b) return null;
+    const u = (b.units || []).find(x => x.id === unitId);
+    if (!u) return null;
+    if (!Array.isArray(u.articles)) u.articles = [];
+    u.articles.push(article);
+    this.saveReadingBooks(books);
+    return article;
+  },
+
+  /** 按 id 覆盖更新文章（state/favorite/blanks.qid 等随对象整体替换） */
+  updateReadingArticle(article) {
+    if (!article || !article.id) return false;
+    const books = this.getReadingBooks();
+    for (const b of books) {
+      for (const u of (b.units || [])) {
+        const i = (u.articles || []).findIndex(x => x.id === article.id);
+        if (i > -1) {
+          u.articles[i] = article;
+          this.saveReadingBooks(books);
+          return true;
+        }
+      }
+    }
+    return false;
+  },
+
+  deleteReadingArticle(articleId) {
+    const books = this.getReadingBooks();
+    for (const b of books) {
+      for (const u of (b.units || [])) {
+        const i = (u.articles || []).findIndex(x => x.id === articleId);
+        if (i > -1) {
+          const qids = this._readingQids([u.articles[i]]);
+          u.articles.splice(i, 1);
+          this.saveReadingBooks(books);
+          if (qids.length) this.deleteQuestionsByIds(qids);
+          return true;
+        }
+      }
+    }
+    return false;
+  },
+
+  /** 记录书的最近学习时间（书架排序用） */
+  touchReadingBook(bookId) {
+    const books = this.getReadingBooks();
+    const b = books.find(x => x.id === bookId);
+    if (!b) return;
+    b.lastStudyAt = Date.now();
+    this.saveReadingBooks(books);
   },
 
   /* ---------------- 训练场（Boss 战 / 拆弹） ---------------- */
