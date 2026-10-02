@@ -486,14 +486,25 @@
     const arts = Store.getArticles();
 
     const listHTML = arts.length ? arts.map(function (a) {
+      /* 语法点数随卡片库增长而变化：每次打开列表都用当前题库重新识别一次，
+         卡片导入得越多，识别越全；并把最新结果回写到文章记录 */
+      const live = analyze(a.text);
+      const pointCount = live.points.length;
+      const newCount = live.points.filter(function (p) { return p.isNew; }).length;
+      if (pointCount !== a.pointCount || newCount !== a.newCount) {
+        a.pointCount = pointCount;
+        a.newCount = newCount;
+        a.difficulty = assessDifficulty(a.text, live.points);
+        Store.updateArticle(a);
+      }
       return '<div class="art-item" data-art="open" data-id="' + a.id + '">' +
         '<div class="ai-main">' +
         '<div class="ai-title">' + B.esc(a.title) + '</div>' +
         '<div class="ai-meta">' +
         '<span>' + fmtDate(a.createdAt) + '</span>' +
         '<span class="badge ' + DIFF_BADGE[a.difficulty] + '">' + B.esc(a.difficulty) + '</span>' +
-        '<span class="badge todo">' + a.pointCount + ' 个语法点</span>' +
-        (a.newCount ? '<span class="badge new-pt">新 ' + a.newCount + '</span>' : '') +
+        '<span class="badge todo">' + pointCount + ' 个语法点</span>' +
+        (newCount ? '<span class="badge new-pt">新 ' + newCount + '</span>' : '') +
         (a.questionIds && a.questionIds.length
           ? '<span class="badge done">练习 ' + a.questionIds.length + ' 题</span>' : '') +
         '</div></div>' +
@@ -520,7 +531,7 @@
     closePop();
     const B = window.AppBridge;
     B.setHTML(
-      '<a class="back-link" href="#/articles">‹ 返回文章列表</a>' +
+      '<a class="back-link" href="#/articles">‹ 返回</a>' +
       '<header class="page-head"><h1>导入文章</h1>' +
       '<div class="sub">粘贴一段日语文章，系统自动识别其中的语法点</div></header>' +
       '<div class="import-card">' +
@@ -565,7 +576,7 @@
     if (!a) {
       B.setHTML('<div class="empty"><span class="e-ico">🔍</span>' +
         '<div class="e-txt">文章不存在或已删除</div>' +
-        '<a class="btn btn-primary" href="#/articles">返回文章列表</a></div>');
+        '<a class="btn btn-primary back-link" href="#/articles">‹ 返回</a></div>');
       return;
     }
     if (!current || !current.article || current.article.id !== id) {
@@ -650,7 +661,7 @@
     const newCount = analysis.points.filter(function (p) { return p.isNew; }).length;
 
     B.setHTML(
-      '<a class="back-link" href="#/articles">‹ 返回文章列表</a>' +
+      '<a class="back-link" href="#/articles">‹ 返回</a>' +
       '<header class="page-head"><h1>文章精读</h1>' +
       '<div class="art-meta-row">' +
       '<span class="badge ' + DIFF_BADGE[a.difficulty] + '">' + B.esc(a.difficulty) + '难度</span>' +
@@ -931,6 +942,8 @@
   window.ArticlePage = {
     renderList: renderList,
     renderNew: renderNew,
-    renderDetail: renderDetail
+    renderDetail: renderDetail,
+    analyze: analyze,
+    assessDifficulty: assessDifficulty
   };
 })();
